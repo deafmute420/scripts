@@ -1,13 +1,9 @@
-from scapy.all import rdpcap, TCP, Raw, HTTP, sniff
+from scapy.all import rdpcap, TCP, Raw, sniff
+from scapy.layers.http import HTTP, HTTPRequest, HTTPResponse
 import re
 import os
-import zlib # For potential Content-Encoding: gzip/deflate, though less common with multipart
-
-# --- Configuration ---
-PCAP_FILE = 'security-footage-1648933966395.pcap'
-# <--- CHANGE THIS to your PCAP file path
-OUTPUT_DIR = 'videostream'   # <--- CHANGE THIS for where to save files
-HTTP_PORT = 8081                   # <--- CHANGE THIS if HTTP is on a different port (e.g., 8080)
+import zlib
+import argparse # Import the argparse module
 
 # --- Helper Functions ---
 
@@ -35,7 +31,7 @@ def dechunk_http_body(chunked_body):
             # or malformed data.
             # If the next bytes are b'0\r\n\r\n', it's the end of the chunked message.
             if chunk_size_hex == b'0':
-                if chunked_body[crlf_pos + 2:crlf_pos + 6] == b'\r\n':
+                if crlf_pos + 4 <= len(chunked_body) and chunked_body[crlf_pos + 2:crlf_pos + 4] == b'\r\n':
                     return dechunked_data # End of chunked transfer
             print(f"Warning: Could not parse chunk size from '{chunk_size_hex}'")
             break # Stop parsing, assume malformed
@@ -110,13 +106,16 @@ def extract_multipart_mixed_replace(pcap_file, output_dir, http_port):
 
     print("Reassembling TCP streams...")
     for pkt in packets:
+        # Check if the packet has the TCP layer and if either source or destination port matches http_port
         if pkt.haslayer(TCP) and (pkt[TCP].sport == http_port or pkt[TCP].dport == http_port):
             # Identify the unique tuple for the stream.
             # We normalize the tuple to represent the stream regardless of direction
-            if pkt[TCP].sport == http_port: # This is a server response
-                stream_key = (pkt.dst, pkt[TCP].dport, pkt.src, pkt[TCP].sport) # client_ip, client_port, server_ip, server_port
-            else: # This is a client request or other traffic
-                stream_key = (pkt.src, pkt[TCP].sport, pkt.dst, pkt[TCP].dport) # client_ip, client_port, server_ip, server_port
+            # The client_ip and client_port should always be the first two elements
+            # The server_ip and server_port should always be the last two elements
+            if pkt[TCP].dport == http_port: # This is a client request to the server
+                stream_key = (pkt.src, pkt[TCP].sport, pkt.dst, pkt[TCP].dport)
+            else: # This is a server response or other traffic from the server
+                stream_key = (pkt.dst, pkt[TCP].dport, pkt.src, pkt[TCP].sport)
 
             if Raw in pkt:
                 payload = bytes(pkt[Raw].load)
@@ -202,6 +201,8 @@ def extract_multipart_mixed_replace(pcap_file, output_dir, http_port):
                 file_ext = get_file_extension(part_content_type)
                 
                 # Generate a unique filename
+                # Use server IP and port for the stream identifier in the filename
+                # Example: stream_192.168.1.100_80_part_1.jpg
                 filename = os.path.join(output_dir, f"stream_{stream_key[2]}_{stream_key[3]}_part_{extracted_count + 1}{file_ext}")
                 
                 try:
@@ -218,8 +219,15 @@ def extract_multipart_mixed_replace(pcap_file, output_dir, http_port):
 
 # --- Run the Script ---
 if __name__ == '__main__':
-    if not os.path.exists(PCAP_FILE):
-        print(f"Error: PCAP file not found at '{PCAP_FILE}'")
-        print("Please update the 'PCAP_FILE' variable in the script.")
-    else:
-        extract_multipart_mixed_replace(PCAP_FILE, OUTPUT_DIR, HTTP_PORT)
+    parser = argparse.ArgumentParser(description="Extract files from multipart/x-mixed-replace HTTP streams in a PCAP.")
+    parser.add_argument('--pcap', type=str, required=True,
+                        help="Path to the input PCAP file.")
+    parser.add_argument('--output', type=str, default='extracted_files',
+                        help="Directory to save extracted files. (default: 'extracted_files')")
+    parser.add_argument('--port', type=int, default=80,
+                        help="HTTP port to listen on. (default: 80)")
+
+    args = parser.parse_args()
+
+    # Now pass the arguments to your main function
+    extract_multipart_mixed_replace(args.pcap, args.output, args.port)
